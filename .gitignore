@@ -1,0 +1,15 @@
+# Notas internas / documentación de exposición
+EXPOSICION.md
+
+# Variables de entorno
+.env
+.env.*
+
+# Datos persistentes de Docker
+postgres-huc-data/
+mysql-clm-data/
+mongodb-lcn-data/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
