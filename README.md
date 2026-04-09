@@ -282,47 +282,236 @@ git clone https://github.com/astivens/MiniClassBDF.git
 cd MiniClassBDF
 ```
 
-### 6.2 Levantar todos los servicios
+---
+
+### 6.2 Entender la topología antes de levantar
+
+El `docker-compose.yml` define **cuatro servicios** interconectados en la red bridge privada `clinicas-caribe`.
+Ninguna base de datos puede ser alcanzada desde fuera de esa red salvo por los puertos expuestos en el host.
+
+```mermaid
+graph LR
+    Host["Host (tu máquina)"]
+
+    subgraph Red["Red Docker: clinicas-caribe (bridge)"]
+        T["trino-coordinator\ntrinodb/trino:latest\n:8080"]
+        P["postgres-huc\npostgres:16\n:5432 interno / :5433 host"]
+        M["mysql-clm\nmysql:8.0\n:3306"]
+        G["mongodb-lcn\nmongo:7\n:27017"]
+    end
+
+    subgraph Volumes["Volúmenes Docker (persistencia)"]
+        VP["postgres-huc-data"]
+        VM["mysql-clm-data"]
+        VG["mongodb-lcn-data"]
+    end
+
+    Host -->|":8080"| T
+    Host -->|":5433"| P
+    Host -->|":3306"| M
+    Host -->|":27017"| G
+
+    T -->|"depends_on: healthy"| P
+    T -->|"depends_on: healthy"| M
+    T -->|"depends_on: started"| G
+
+    P --- VP
+    M --- VM
+    G --- VG
+```
+
+#### Detalles por servicio
+
+**► `trino-coordinator`**
+
+| Propiedad | Valor |
+|---|---|
+| Imagen | `trinodb/trino:latest` |
+| Puerto expuesto | `8080` → `8080` (HTTP, Web UI y API) |
+| Volumen montado | `./trino/catalog` → `/etc/trino/catalog` (catálogos de fuentes) |
+| Arranque | Solo cuando PostgreSQL y MySQL reportan `healthy`; MongoDB basta con `started` |
+
+**► `postgres-huc`**
+
+| Propiedad | Valor |
+|---|---|
+| Imagen | `postgres:16` |
+| Puerto expuesto | `5433` → `5432` interno (evita conflicto con Postgres local) |
+| Base de datos | `huc_db` / usuario: `huc_admin` |
+| Init scripts | `./init-scripts/postgresql/` → `/docker-entrypoint-initdb.d/` |
+| Persistencia | Volumen `postgres-huc-data` → `/var/lib/postgresql/data` |
+| Healthcheck | `pg_isready -U huc_admin -d huc_db` cada 5 s, hasta 10 reintentos |
+
+**► `mysql-clm`**
+
+| Propiedad | Valor |
+|---|---|
+| Imagen | `mysql:8.0` |
+| Puerto expuesto | `3306` → `3306` |
+| Base de datos | `clm_db` / usuario: `clm_admin` |
+| Init scripts | `./init-scripts/mysql/` → `/docker-entrypoint-initdb.d/` |
+| Persistencia | Volumen `mysql-clm-data` → `/var/lib/mysql` |
+| Healthcheck | `mysqladmin ping` con usuario `root` cada 5 s, hasta 10 reintentos |
+
+**► `mongodb-lcn`**
+
+| Propiedad | Valor |
+|---|---|
+| Imagen | `mongo:7` |
+| Puerto expuesto | `27017` → `27017` |
+| Base de datos | `lcn_db` / usuario: `lcn_admin` |
+| Init scripts | `./init-scripts/mongodb/` → `/docker-entrypoint-initdb.d/` |
+| Persistencia | Volumen `mongodb-lcn-data` → `/data/db` |
+| Healthcheck | Ninguno definido — Trino espera `service_started`, no `healthy` |
+
+> **Por qué MongoDB no tiene healthcheck**
+> El cliente JDBC de MongoDB establece conexión de forma lazy; Trino no necesita que el servidor esté completamente listo antes de arrancar. Las conexiones se intentan en el momento de la primera consulta.
+
+---
+
+### 6.3 Levantar todos los servicios
 
 ```bash
 docker compose up -d
 ```
 
-Docker Compose inicia los servicios en orden controlado: las bases de datos arrancan primero y deben superar sus `healthchecks` antes de que Trino se inicialice. El proceso completo tarda aproximadamente 30–60 segundos.
+La bandera `-d` (`--detach`) ejecuta los contenedores en segundo plano.
+Docker Compose respeta el orden de `depends_on`: primero arranca `postgres-huc` y `mysql-clm`, espera a que sus healthchecks pasen a `healthy`, y solo entonces inicia `trino-coordinator`.
 
-| Servicio | Imagen | Puerto | Estado esperado |
-|---|---|:---:|---|
-| `trino-coordinator` | `trinodb/trino:latest` | `8080` | `Up` |
-| `postgres-huc` | `postgres:16` | `5433` | `healthy` |
-| `mysql-clm` | `mysql:8.0` | `3306` | `healthy` |
-| `mongodb-lcn` | `mongo:7` | `27017` | `Up` |
+**Seguir los logs en tiempo real durante el arranque:**
 
-### 6.3 Verificar el estado
+```bash
+# Todos los servicios a la vez
+docker compose logs -f
+
+# Solo Trino (para ver cuando termina de cargar los catálogos)
+docker compose logs -f trino-coordinator
+
+# Solo las bases de datos
+docker compose logs -f postgres-huc mysql-clm mongodb-lcn
+```
+
+Trino está listo cuando aparece en sus logs:
+
+```
+INFO  main  com.facebook.airlift.http.server.HttpServerProvider  Started
+```
+
+---
+
+### 6.4 Verificar el estado de los contenedores
 
 ```bash
 docker compose ps
 ```
 
-### 6.4 Acceder a Trino
+Salida esperada cuando todo está correcto:
 
-**▶ CLI interactiva:**
+```
+NAME                 IMAGE                    STATUS
+trino-coordinator    trinodb/trino:latest     Up
+postgres-huc         postgres:16              Up (healthy)
+mysql-clm            mysql:8.0                Up (healthy)
+mongodb-lcn          mongo:7                  Up
+```
+
+Verificar el uso de recursos en tiempo real:
+
+```bash
+docker stats
+```
+
+---
+
+### 6.5 Acceder a Trino
+
+**▶ CLI interactiva (recomendado para ejecutar queries):**
 
 ```bash
 docker exec -it trino-coordinator trino
 ```
 
+Dentro de la CLI puedes cambiar el catálogo y esquema por defecto para no tener que prefijarlo en cada query:
+
+```sql
+-- Cambiar catálogo activo
+USE postgresql.public;
+
+-- Verificar catálogo y esquema activos
+SELECT current_catalog, current_schema;
+```
+
 **▶ Interfaz web (Web UI):**
 
-Abre [`http://localhost:8080`](http://localhost:8080) para ver el panel de métricas: consultas activas, workers, throughput y uso de memoria.
+Abre [`http://localhost:8080`](http://localhost:8080) en tu navegador.
+La Web UI muestra en tiempo real: consultas activas, historial de ejecución, plan de la query, workers disponibles y uso de memoria.
 
-### 6.5 Detener el entorno
+**▶ Conexión desde un cliente externo (DBeaver, DataGrip, etc.):**
+
+Usa el driver JDBC de Trino con la siguiente cadena de conexión:
+
+```
+Host:     localhost
+Port:     8080
+Database: (dejar vacío o escribir el catálogo deseado, ej: postgresql)
+Driver:   io.trino.jdbc.TrinoDriver
+URL:      jdbc:trino://localhost:8080/postgresql/public
+```
+
+No se requiere contraseña en el entorno local de desarrollo.
+
+---
+
+### 6.6 Inicialización de datos
+
+Los scripts de `init-scripts/` se ejecutan **automáticamente una sola vez** al crear los contenedores,
+antes de que el motor acepte conexiones externas:
+
+| Script | Motor | Contenido |
+|---|---|---|
+| `init-scripts/postgresql/01-init-huc.sql` | PostgreSQL | Crea tablas `pacientes`, `consultas`, `diagnosticos` e inserta datos de ejemplo |
+| `init-scripts/mysql/01-init-clm.sql` | MySQL | Crea tablas `pacientes`, `citas`, `prescripciones`, `medicos` e inserta datos |
+| `init-scripts/mongodb/01-init-lcn.js` | MongoDB | Crea colecciones `pacientes`, `resultados_laboratorio`, define `_schema` para Trino e inserta documentos |
+
+> **Importante:** Si el volumen ya existe (contenedor reiniciado, no recreado), los init scripts **no se vuelven a ejecutar**. Los datos persisten entre reinicios. Para volver al estado inicial limpio usa `docker compose down -v && docker compose up -d`.
+
+---
+
+### 6.7 Comandos de operación frecuente
 
 ```bash
-# Detener contenedores (datos persisten en volúmenes)
+# Reiniciar un servicio específico sin bajar los demás
+docker compose restart trino-coordinator
+
+# Reconstruir y recrear solo un servicio
+docker compose up -d --force-recreate trino-coordinator
+
+# Ver variables de entorno activas en un contenedor
+docker inspect postgres-huc --format '{{range .Config.Env}}{{println .}}{{end}}'
+
+# Conectarse directamente a PostgreSQL (sin pasar por Trino)
+docker exec -it postgres-huc psql -U huc_admin -d huc_db
+
+# Conectarse directamente a MySQL
+docker exec -it mysql-clm mysql -u clm_admin -pclm_pass_2024 clm_db
+
+# Conectarse directamente a MongoDB
+docker exec -it mongodb-lcn mongosh -u lcn_admin -p lcn_pass_2024 --authenticationDatabase admin lcn_db
+```
+
+---
+
+### 6.8 Detener y limpiar el entorno
+
+```bash
+# Detener contenedores — los datos persisten en los volúmenes
 docker compose down
 
-# Detener y eliminar todos los datos
+# Detener y eliminar todos los datos (limpieza total)
 docker compose down -v
+
+# Eliminar también las imágenes descargadas
+docker compose down -v --rmi all
 ```
 
 ---
