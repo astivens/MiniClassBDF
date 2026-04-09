@@ -1,0 +1,101 @@
+services:
+  # =============================================
+  # Trino - Motor de consulta federada
+  # =============================================
+  trino-coordinator:
+    image: trinodb/trino:latest
+    container_name: trino-coordinator
+    hostname: trino-coordinator
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    depends_on:
+      postgres-huc:
+        condition: service_healthy
+      mysql-clm:
+        condition: service_healthy
+      mongodb-lcn:
+        condition: service_started
+    networks:
+      - clinicas-caribe
+
+  # =============================================
+  # PostgreSQL - Hospital Universitario del Caribe (HUC)
+  # Sistema LEGADO de los 2000s
+  # =============================================
+  postgres-huc:
+    image: postgres:16
+    container_name: postgres-huc
+    hostname: postgres-huc
+    environment:
+      POSTGRES_DB: huc_db
+      POSTGRES_USER: huc_admin
+      POSTGRES_PASSWORD: huc_pass_2024
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init-scripts/postgresql:/docker-entrypoint-initdb.d
+      - postgres-huc-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U huc_admin -d huc_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - clinicas-caribe
+
+  # =============================================
+  # MySQL - Clínica La Manga (CLM)
+  # Sistema moderno EHR
+  # =============================================
+  mysql-clm:
+    image: mysql:8.0
+    container_name: mysql-clm
+    hostname: mysql-clm
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass_2024
+      MYSQL_DATABASE: clm_db
+      MYSQL_USER: clm_admin
+      MYSQL_PASSWORD: clm_pass_2024
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./init-scripts/mysql:/docker-entrypoint-initdb.d
+      - mysql-clm-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_pass_2024"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - clinicas-caribe
+
+  # =============================================
+  # MongoDB - Laboratorio Clínico del Norte (LCN)
+  # Sistema de resultados de laboratorio
+  # =============================================
+  mongodb-lcn:
+    image: mongo:7
+    container_name: mongodb-lcn
+    hostname: mongodb-lcn
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: lcn_admin
+      MONGO_INITDB_ROOT_PASSWORD: lcn_pass_2024
+      MONGO_INITDB_DATABASE: lcn_db
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./init-scripts/mongodb:/docker-entrypoint-initdb.d
+      - mongodb-lcn-data:/data/db
+    networks:
+      - clinicas-caribe
+
+volumes:
+  postgres-huc-data:
+  mysql-clm-data:
+  mongodb-lcn-data:
+
+networks:
+  clinicas-caribe:
+    driver: bridge
